@@ -1,3 +1,5 @@
+%global debug_package %{nil}
+
 # Enable building from outside build system
 %{!?pxrelease:%define pxrelease 0.0}
 %{!?release:%define release 0}
