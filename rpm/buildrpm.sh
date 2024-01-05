@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/bash -e
 
 [ -z "${KERNELPATH}" ] && KERNELPATH="/usr/src/kernels/$(/bin/uname -r)"
 [ -z "${VERSION}" ] && VERSION="0.0.0"
