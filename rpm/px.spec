@@ -80,8 +80,8 @@ if [ -e /%{name}.files ]; then
    for fl in ${FILES}; do echo $fl | /bin/egrep -q ${MDIR} || cp -af $fl ${MDIR}; done;      
    [ -e /etc/modules ] && /bin/egrep -q '^%{name}$' /etc/modules || echo -e '%{name}' >> /etc/modules
    [ -d /etc/modules-load.d -a ! -e /etc/modules-load.d/px.conf ] && echo -e '%{name}' > /etc/modules-load.d/px.conf
-   depmod -a
-   modprobe %{name}
+   depmod -a || echo 'depmod failed for px module' &>2
+   modprobe %{name} || echo 'modprobe failed for px module' &>2
 fi
 
 %postun
