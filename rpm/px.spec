@@ -52,6 +52,7 @@ make clean all
 rm -rf $RPM_BUILD_ROOT
 INSTALL_MOD_PATH=$RPM_BUILD_ROOT make install
 
+echo "Starting rpm install with KVERSION=${KVERSION}" &>2
 LOC=`pwd`
 cd $RPM_BUILD_ROOT
 # Create file list for rpm install
@@ -74,47 +75,18 @@ cd -
 
 %post
 
-lsmod | egrep -q '^%{name} '
-[ $? -eq 0 ] && rmmod %{name}
-
-if [ -e /%{name}.files ]; then 
-   MDIR="/lib/modules/$(uname -r)/extra"
-   mkdir -p ${MDIR}
-   FILES=$(cat /%{name}.files| /bin/egrep -v %{name}.files | /bin/sed -e 's/"//g')
-   for fl in ${FILES}; do echo $fl | /bin/egrep -q ${MDIR} || cp -af $fl ${MDIR}; done;      
-   [ -e /etc/modules ] && /bin/egrep -q '^%{name}$' /etc/modules || echo -e '%{name}' >> /etc/modules
-   [ -d /etc/modules-load.d -a ! -e /etc/modules-load.d/px.conf ] && echo -e '%{name}' > /etc/modules-load.d/px.conf
-   depmod -a
-   modprobe %{name}
+if [ -e /%{name}.files ]; then
+   TARGET_KERNEL_MODULES_DIR=$(cat "/%{name}.files" | grep "\/lib\/modules" | head -1 | cut -d '"' -f 2 | cut -d "/" -f 4) # ewww...
+   echo "Running depmod against '${TARGET_KERNEL_MODULES_DIR}' for px module..."
+   depmod "${TARGET_KERNEL_MODULES_DIR}" || echo "depmod failed for px module against '${TARGET_KERNEL_MODULES_DIR}'" &>2 
 fi
 
 %postun
-
-POSTUN=$1
-
-[ "${POSTUN}" == "purge" -o "${POSTUN}" == "remove" ] && POSTUN=0
-
-if [ "${POSTUN}" == "0" ]; then
-    lsmod | egrep -q '^%{name} '
-    [ $? -eq 0 ] && rmmod %{name}
-
-    MODCONF=/etc/modules
-    if [ -e ${MODCONF} ]; then
-	/bin/egrep -q '^%{name}$' ${MODCONF}
-	if [ $? -eq 0 ]; then
-	    cat ${MODCONF} | egrep -v '^%{name}$' > ${MODCONF}.$$
-	    /bin/mv ${MODCONF}.$$ ${MODCONF}
-	fi
-    fi
-
-    [ -e /etc/modules-load.d/px.conf ] && /bin/rm -f /etc/modules-load.d/px.conf
-
-    /bin/rm -f /lib/modules/$(uname -r)/extra/%{name}.ko
-fi
+echo 'post uninstall for px module, doing nothing.' &>2
 
 %preun
-#if [ $1 = 0 ]; then
-#fi
+echo 'pre uninstall for px module, doing nothing.' &>2
+
 
 %changelog
 * Sat Jan 16 2016 jvinod
