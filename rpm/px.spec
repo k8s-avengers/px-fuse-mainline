@@ -16,6 +16,10 @@ BuildRoot: %{_tmppath}/%{name}-%{version}-%{release}-root-%(%{__id_u} -n)
 Obsoletes: %name
 autoreqprov: no
 
+# From mainline linux's mkspec, to convince rpmbuild to not strip the module (and avoid breaking BTF info, if any, and signature, if any)
+%define __spec_install_post /usr/lib/rpm/brp-compress || :
+%define debug_package %{nil}
+
 %if 0%{?required:1}
 Requires: %required
 %endif
