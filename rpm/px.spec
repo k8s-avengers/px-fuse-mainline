@@ -20,14 +20,6 @@ autoreqprov: no
 %define __spec_install_post /usr/lib/rpm/brp-compress || :
 %define debug_package %{nil}
 
-%if 0%{?required:1}
-Requires: %required
-%endif
-
-%if 0%{?required_rpms:1}
-BuildRequires: %required_rpms
-%endif
-
 %description
   %rpmdescription
 
