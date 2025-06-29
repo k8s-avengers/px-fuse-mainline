@@ -1291,7 +1291,6 @@ static int fuse_dev_fasync(int fd, struct file *file, int on)
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4,0,0)
 const struct file_operations fuse_dev_operations = {
 	.owner		= THIS_MODULE,
-	.llseek		= no_llseek,
 	.read		= do_sync_read,
 	.aio_read	= fuse_dev_read,
 	.splice_read	= fuse_dev_splice_read,
@@ -1305,7 +1304,6 @@ const struct file_operations fuse_dev_operations = {
 #else
 const struct file_operations fuse_dev_operations = {
 	.owner		= THIS_MODULE,
-	.llseek		= no_llseek,
 	.read_iter	= fuse_dev_read_iter,
 	.splice_read	= fuse_dev_splice_read,
 	.write_iter	= fuse_dev_write_iter,
