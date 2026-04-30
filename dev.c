@@ -26,6 +26,7 @@
 #include "pxd_compat.h"
 #include "pxd_fastpath.h"
 #include "pxd_core.h"
+#include "pxd_trace.h"
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4,6,0)
 #define PAGE_CACHE_GET(page) get_page(page)
@@ -244,6 +245,9 @@ void fuse_request_send_nowait(struct fuse_conn *fc, struct fuse_req *req)
 		len_args(req->in.numargs, (struct fuse_arg *)req->in.args);
 
 	req->in.h.unique = fuse_get_unique(fc);
+	trace_pxd_request(req->pxd_dev->dev_id, req->in.h.unique, req->pxd_rdwr_in.size,
+		req->pxd_rdwr_in.offset, req->pxd_dev->minor, req->rq != NULL ? req_op(req->rq): -1,
+		req->rq != NULL ? req->rq->cmd_flags : -1, req->in.h.opcode, req->pxd_rdwr_in.flags);
 	fc->request_map[req->in.h.unique & (FUSE_MAX_REQUEST_IDS - 1)] = req;
 
 	/*
@@ -294,7 +298,7 @@ __acquires(fc->lock)
 	remove_wait_queue(&fc->waitq, &wait);
 }
 
-ssize_t fuse_copy_req_read(struct fuse_req *req, struct iov_iter *iter)
+static ssize_t fuse_copy_req_read(struct fuse_req *req, struct iov_iter *iter)
 {
 	size_t copied, len;
 
@@ -340,7 +344,6 @@ static bool __check_zero_page_write(char *base, size_t len) {
 /* Check if the request is writing zeroes and if so, convert it as a discard
  * request.
  */
-#ifndef __PXD_BIO_MAKEREQ__
 static void __fuse_convert_zero_writes(struct fuse_req *req)
 {
 	struct req_iterator breq_iter;
@@ -365,32 +368,6 @@ static void __fuse_convert_zero_writes(struct fuse_req *req)
 	}
 	req->in.h.opcode = PXD_DISCARD;
 }
-#else
-static void __fuse_convert_zero_writes(struct fuse_req *req)
-{
-#if defined(HAVE_BVEC_ITER)
-	struct bvec_iter bvec_iter;
-	struct bio_vec bvec;
-#else
-	int bvec_iter;
-	struct bio_vec *bvec = NULL;
-#endif
-	char *kaddr, *p;
-	size_t len;
-
-	bio_for_each_segment(bvec, req->bio, bvec_iter) {
-		kaddr = kmap_atomic(BVEC(bvec).bv_page);
-		p = kaddr + BVEC(bvec).bv_offset;
-		len = BVEC(bvec).bv_len;
-		if (!__check_zero_page_write(p, len)) {
-			kunmap_atomic(kaddr);
-			return;
-		}
-		kunmap_atomic(kaddr);
-	}
-	req->in.h.opcode = PXD_DISCARD;
-}
-#endif
 
 void fuse_convert_zero_writes(struct fuse_req *req)
 {
@@ -577,6 +554,7 @@ static int fuse_notify_add_ext(struct fuse_conn *conn, unsigned int size,
 		printk(KERN_ERR "%s: can't copy arg\n", __func__);
 		return -EFAULT;
 	}
+	trace_fuse_notify_add_ext(add.dev_id, add.size, add.queue_depth, add.discard_size, add.open_mode, add.enable_fp, add.paths.count);
 	return pxd_add(conn, &add);
 }
 
@@ -597,7 +575,8 @@ struct fuse_req *request_find(struct fuse_conn *fc, u64 unique)
 	return req;
 }
 
-struct fuse_req* request_find_in_ctx(unsigned ctx, u64 unique)
+/*
+static struct fuse_req* request_find_in_ctx(unsigned ctx, u64 unique)
 {
 	struct pxd_context *pctx = find_context(ctx);
 
@@ -605,6 +584,7 @@ struct fuse_req* request_find_in_ctx(unsigned ctx, u64 unique)
 
 	return request_find(&pctx->fc, unique);
 }
+*/
 
 #define IOV_BUF_SIZE 64
 
@@ -615,6 +595,7 @@ static int copy_in_read_data_iovec(struct iov_iter *iter,
 	int iovcnt;
 	size_t len;
 
+	trace_copy_in_read_data_iovec(read_data->unique, read_data->iovcnt, read_data->iovcnt - min(read_data->iovcnt, IOV_BUF_SIZE));
 	if (!read_data->iovcnt)
 		return -EFAULT;
 
@@ -626,12 +607,12 @@ static int copy_in_read_data_iovec(struct iov_iter *iter,
 	}
 	read_data->iovcnt -= iovcnt;
 
+
 	iov_iter_init(data_iter, READ, iov, iovcnt, iov_length(iov, iovcnt));
 
 	return 0;
 }
 
-#ifndef __PXD_BIO_MAKEREQ__
 static int __fuse_notify_read_data(struct fuse_conn *conn,
 		struct fuse_req *req,
 		struct pxd_read_data_out *read_data_p, struct iov_iter *iter)
@@ -651,13 +632,21 @@ static int __fuse_notify_read_data(struct fuse_conn *conn,
 	if (ret)
 		return ret;
 
+	trace_fuse_notify_read_data_request(req->pxd_dev->dev_id, read_data_p->unique, blk_rq_pos(req->rq) * SECTOR_SIZE,
+		blk_rq_bytes(req->rq), req->pxd_rdwr_in.offset, read_data_p->offset);
+
 	/* advance the iterator if data is unaligned */
-	if (unlikely(req->pxd_rdwr_in.offset & PXD_LBS_MASK))
+	if (unlikely(req->pxd_rdwr_in.offset & PXD_LBS_MASK)) {
 		iov_iter_advance(&data_iter,
 				 req->pxd_rdwr_in.offset & PXD_LBS_MASK);
+	}
 
 	rq_for_each_segment(bvec, req->rq, breq_iter) {
 		ssize_t len = BVEC(bvec).bv_len;
+
+		trace_fuse_notify_read_data_segment_info(req->pxd_dev->dev_id, read_data_p->unique,
+			BVEC(bvec).bv_offset,
+			BVEC(bvec).bv_len);
 		copied = 0;
 		if (skipped < read_data_p->offset) {
 			if (read_data_p->offset - skipped >= len) {
@@ -672,6 +661,10 @@ static int __fuse_notify_read_data(struct fuse_conn *conn,
 			size_t copy_this = copy_page_to_iter(BVEC(bvec).bv_page,
 				BVEC(bvec).bv_offset + copied,
 				len - copied, &data_iter);
+
+			trace_fuse_notify_read_data_copy(req->pxd_dev->dev_id, read_data_p->unique, copied, copy_this,
+				BVEC(bvec).bv_offset, BVEC(bvec).bv_offset + copied,
+				BVEC(bvec).bv_len, len - copied, iter->count);
 			if (copy_this != len - copied) {
 				if (!iter->count)
 					return 0;
@@ -681,13 +674,16 @@ static int __fuse_notify_read_data(struct fuse_conn *conn,
 					iov, &data_iter);
 				if (ret)
 					return ret;
-				len -= copied;
+				len -= (copied + copy_this);
 				copied = copy_page_to_iter(BVEC(bvec).bv_page,
 					BVEC(bvec).bv_offset + copied + copy_this,
 					len, &data_iter);
+				trace_fuse_notify_read_data_finalcopy(req->pxd_dev->dev_id, read_data_p->unique, len, copied,
+					BVEC(bvec).bv_offset, BVEC(bvec).bv_offset + copied + copy_this,
+					BVEC(bvec).bv_len);
 				if (copied != len) {
-					printk(KERN_ERR "%s: copy failed new iovec\n",
-						__func__);
+					printk(KERN_ERR "%s: copy failed new iovec, bio_vec : page = %p len = %d offset = %d\n",
+						__func__, BVEC(bvec).bv_page, BVEC(bvec).bv_len, BVEC(bvec).bv_offset);
 					return -EFAULT;
 				}
 			}
@@ -696,74 +692,6 @@ static int __fuse_notify_read_data(struct fuse_conn *conn,
 
 	return 0;
 }
-
-#else
-static int __fuse_notify_read_data(struct fuse_conn *conn,
-		struct fuse_req *req,
-		struct pxd_read_data_out *read_data_p, struct iov_iter *iter)
-{
-	struct iovec iov[IOV_BUF_SIZE];
-	struct iov_iter data_iter;
-#ifdef HAVE_BVEC_ITER
-	struct bio_vec bvec;
-	struct bvec_iter bvec_iter;
-#else
-	struct bio_vec *bvec = NULL;
-	int bvec_iter;
-#endif
-	size_t copied, skipped = 0;
-	int ret;
-
-	ret = copy_in_read_data_iovec(iter, read_data_p, iov, &data_iter);
-	if (ret)
-		return ret;
-
-	/* advance the iterator if data is unaligned */
-	if (unlikely(req->pxd_rdwr_in.offset & PXD_LBS_MASK))
-		iov_iter_advance(&data_iter,
-				 req->pxd_rdwr_in.offset & PXD_LBS_MASK);
-
-	bio_for_each_segment(bvec, req->bio, bvec_iter) {
-		ssize_t len = BVEC(bvec).bv_len;
-		copied = 0;
-		if (skipped < read_data_p->offset) {
-			if (read_data_p->offset - skipped >= len) {
-				skipped += len;
-				copied = len;
-			} else {
-				copied = read_data_p->offset - skipped;
-				skipped = read_data_p->offset;
-			}
-		}
-		if (copied < len) {
-			size_t copy_this = copy_page_to_iter(BVEC(bvec).bv_page,
-				BVEC(bvec).bv_offset + copied,
-				len - copied, &data_iter);
-			if (copy_this != len - copied) {
-				if (!iter->count)
-					return 0;
-
-				/* out of space in destination, copy more iovec */
-				ret = copy_in_read_data_iovec(iter, read_data_p,
-					iov, &data_iter);
-				if (ret)
-					return ret;
-				len -= copied;
-				copied = copy_page_to_iter(BVEC(bvec).bv_page,
-					BVEC(bvec).bv_offset + copied + copy_this,
-					len, &data_iter);
-				if (copied != len) {
-					printk(KERN_ERR "%s: copy failed new iovec\n",
-						__func__);
-					return -EFAULT;
-				}
-			}
-		}
-	}
-
-	return 0;
-}
-#endif
 
 static int fuse_notify_read_data(struct fuse_conn *conn, unsigned int size,
 				struct iov_iter *iter)
@@ -944,7 +872,6 @@ static int fuse_notify(struct fuse_conn *fc, enum fuse_notify_code code,
  * it from the list and copy the rest of the buffer to the request.
  * The request is finished by calling request_end()
  */
-#ifndef __PXD_BIO_MAKEREQ__
 static int __fuse_dev_do_write(struct fuse_conn *fc,
 		struct fuse_req *req, struct iov_iter *iter)
 {
@@ -976,42 +903,6 @@ static int __fuse_dev_do_write(struct fuse_conn *fc,
 	request_end(fc, req, true);
 	return 0;
 }
-#else
-static int __fuse_dev_do_write(struct fuse_conn *fc,
-		struct fuse_req *req, struct iov_iter *iter)
-{
-#if defined(HAVE_BVEC_ITER)
-	struct bio_vec bvec;
-	struct bio *breq = req->bio;
-	int nsegs = bio_segments(breq);
-	struct bvec_iter bvec_iter;
-#else
-	struct bio_vec *bvec = NULL;
-	struct bio *breq = req->bio;
-	int nsegs = bio_segments(breq);
-	int bvec_iter;
-#endif
-
-	if (req->in.h.opcode == PXD_READ && iter->count > 0) {
-		if (nsegs) {
-			int i = 0;
-			bio_for_each_segment(bvec, breq, bvec_iter) {
-				ssize_t len = BVEC(bvec).bv_len;
-				if (copy_page_from_iter(BVEC(bvec).bv_page,
-							BVEC(bvec).bv_offset,
-							len, iter) != len) {
-					printk(KERN_ERR "%s: copy page %d of %d error\n",
-					       __func__, i, nsegs);
-					return -EFAULT;
-				}
-				i++;
-			}
-		}
-	}
-	request_end(fc, req, true);
-	return 0;
-}
-#endif
 
 static ssize_t fuse_dev_do_write(struct fuse_conn *fc, struct iov_iter *iter)
 {
@@ -1252,7 +1143,7 @@ void fuse_abort_conn(struct fuse_conn *fc)
 	spin_unlock(&fc->lock);
 }
 
-int fuse_dev_release(struct inode *inode, struct file *file)
+static int fuse_dev_release(struct inode *inode, struct file *file)
 {
 	struct fuse_conn *fc = fuse_get_conn(file);
 	if (fc) {
@@ -1303,7 +1194,11 @@ const struct file_operations fuse_dev_operations = {
 #else
 const struct file_operations fuse_dev_operations = {
 	.owner		= THIS_MODULE,
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6,0,0)
 	.llseek		= no_llseek,
+#else
+	.llseek         = NULL,
+#endif
 	.read_iter	= fuse_dev_read_iter,
 	.splice_read	= fuse_dev_splice_read,
 	.write_iter	= fuse_dev_write_iter,

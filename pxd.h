@@ -43,12 +43,12 @@
 #define PXD_IOC_UNREGISTER_FILE	_IO(PXD_IOCTL_MAGIC, 8)		/* 0x505808 */
 #define PXD_IOC_FPCLEANUP		_IO(PXD_IOCTL_MAGIC, 9)		/* 0x505809 */
 #define PXD_IOC_IO_FLUSHER		_IO(PXD_IOCTL_MAGIC, 10)	/* 0x50580a */
+#define PXD_IOC_DETACH_DEVICE		_IO(PXD_IOCTL_MAGIC, 11)	/* 0x50580b */
 
-#define PXD_MAX_DEVICES	512			/**< maximum number of devices supported */
+#define PXD_MAX_DEVICES	1024		/**< maximum number of devices supported */
 #define PXD_MAX_IO		(1024*1024)	/**< maximum io size in bytes */
 #define PXD_MAX_QDEPTH  256			/**< maximum device queue depth */
-#define PXD_MIN_DISCARD_GRANULARITY		PXD_LBS
-#define PXD_MAX_DISCARD_GRANULARITY		(64 * 1024)
+#define PXD_MAX_DISCARD_GRANULARITY		(1 << 20) /**< 1MiB discard granularity on pxd device to cover all pool behavior */
 
 // use by fastpath for congestion control
 #define DEFAULT_CONGESTION_THRESHOLD (PXD_MAX_QDEPTH)
@@ -62,6 +62,7 @@
 #define PROC_PX_CONTROL		"px"
 #define PROC_PX_TOOL		"pxd"
 #define PROC_PX_UT			"t"
+#define PROC_PX_TEST            "pxd_test"
 
 /** fuse opcodes */
 enum pxd_opcode {
@@ -187,6 +188,14 @@ struct pxd_update_size {
 };
 
 /**
+ * PXD_DETACH_DEVICE ioctl from user space
+ */
+struct pxd_detach_device {
+	uint64_t dev_id;
+	int context_id;
+};
+
+/**
  * PXD_SET_FASTPATH request from user space
  */
 struct pxd_fastpath_out {
@@ -226,11 +235,13 @@ struct pxd_device* find_pxd_device(struct pxd_context *ctx, uint64_t dev_id);
 // No arguments necessary other than opcode
 #define PXD_FEATURE_FASTPATH (0x1)
 #define PXD_FEATURE_ATTACH_OPTIMIZED (0x2)
+// supports disabling discards, discard granularity at 2M(large)
+#define PXD_FEATURE_DISCARD_CONTROL (0x4)
 
 static inline
 int pxd_supported_features(void)
 {
-    int features = PXD_FEATURE_ATTACH_OPTIMIZED;
+    int features = PXD_FEATURE_ATTACH_OPTIMIZED | PXD_FEATURE_DISCARD_CONTROL;
 #ifdef __PX_FASTPATH__
     features |= PXD_FEATURE_FASTPATH;
 #endif

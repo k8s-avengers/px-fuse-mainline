@@ -22,7 +22,27 @@
 #define HAVE_BVEC_ITER
 #endif
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,7,0) || defined(REQ_PREFLUSH)
+#ifdef RHEL_RELEASE_CODE
+#if RHEL_RELEASE_CODE >= RHEL_RELEASE_VERSION(9, 6) && !defined(__ELREPO9__)
+#define BLK_QUEUE_FLUSH(q)  q->limits.features |= BLK_FEAT_WRITE_CACHE | BLK_FEAT_FUA
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(4,7,0) || defined(REQ_PREFLUSH)
+#define BLK_QUEUE_FLUSH(q) \
+       blk_queue_write_cache(q, true, true)
+#else
+#define BLK_QUEUE_FLUSH(q) \
+       blk_queue_flush(q, REQ_FLUSH | REQ_FUA)
+#endif
+#elif (defined(__ELREPO9__)) 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,11,0)
+#define BLK_QUEUE_FLUSH(q) \
+	q->limits.features |= BLK_FEAT_WRITE_CACHE | BLK_FEAT_FUA
+#else
+#define BLK_QUEUE_FLUSH(q) blk_queue_write_cache(q, true, true)
+#endif
+#elif (LINUX_VERSION_CODE >= KERNEL_VERSION(6,11,0) || (LINUX_VERSION_CODE >= KERNEL_VERSION(5,14,0) && defined(__EL8__) && !defined(__ORACLE_UEK__)))
+#define BLK_QUEUE_FLUSH(q) \
+	q->limits.features |= BLK_FEAT_WRITE_CACHE | BLK_FEAT_FUA
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(4,7,0) || defined(REQ_PREFLUSH)
 #define BLK_QUEUE_FLUSH(q) \
 	blk_queue_write_cache(q, true, true)
 #else
@@ -141,7 +161,21 @@ static inline unsigned int get_op_flags(struct bio *bio)
 // Pulled from v5.19.17/source/block/genhd.c
 static inline char *bdevname(struct block_device *bdev, char *buf) {
         struct gendisk *hd = bdev->bd_disk;
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6,10,0)
+#if defined(__EL9_STREAM__)
+	int partno = bdev_partno(bdev);
+#elif defined(RHEL_RELEASE_CODE) && defined(RHEL_RELEASE_VERSION) 
+#if RHEL_RELEASE_CODE >= RHEL_RELEASE_VERSION(9, 7)
+	int partno = bdev_partno(bdev);
+#else
 	int partno = bdev->bd_partno;
+#endif
+#else
+	int partno = bdev->bd_partno;
+#endif
+#else
+	int partno = BD_PARTNO;
+#endif
 
 	if (!partno)
 		snprintf(buf, BDEVNAME_SIZE, "%s", hd->disk_name);
@@ -173,13 +207,20 @@ static inline char *bdevname(struct block_device *bdev, char *buf) {
 #endif
 
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,2,0) || (LINUX_VERSION_CODE == KERNEL_VERSION(5,14,0) && defined(__EL8__) && defined(QUEUE_FLAG_SKIP_TAGSET_QUIESCE))
+#ifdef RHEL_RELEASE_CODE
+#if RHEL_RELEASE_CODE >= RHEL_RELEASE_VERSION(9, 3)
 static inline void bio_set_op_attrs(struct bio *bio, enum req_op op,
                                     blk_opf_t op_flags)
 {
-  bio->bi_opf = op;
+  bio->bi_opf = op | op_flags;
 }
-
+#endif
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(6,2,0)
+static inline void bio_set_op_attrs(struct bio *bio, enum req_op op,
+                                    blk_opf_t op_flags)
+{
+  bio->bi_opf = op | op_flags;
+}
 #endif
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4,8,0)
@@ -191,5 +232,48 @@ static inline void bio_set_op_attrs(struct bio *bio, enum req_op op,
 	(b)->bi_rw = op; \
 } while (0)
 #endif
+
+// Function to enable QUEUE_FLAG_DISCARD for kernels < 5.19
+// For kernels >= 5.19, the flag is deprecated and discard is controlled via queue_limits only
+static inline void DISCARD_ENABLE(struct request_queue *q __attribute__((unused))) {
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5,19,0)
+#if defined(__EL8__) || defined(__SUSE_EQ_SP5__)
+#if defined(QUEUE_FLAG_DISCARD)
+	QUEUE_FLAG_SET(QUEUE_FLAG_DISCARD, q)
+#endif
+#else
+	QUEUE_FLAG_SET(QUEUE_FLAG_DISCARD, q)
+#endif
+#endif
+}
+
+/*
+ * IDA API compatibility layer
+ *
+ * ida_simple_get() and ida_simple_remove() were removed in kernel 6.18.
+ * The modern API uses ida_alloc_range() and ida_free().
+ *
+ * Key difference: ida_alloc_range() takes an INCLUSIVE max value,
+ * while ida_simple_get() took an EXCLUSIVE max value.
+ */
+
+/* Kernel 6.18+: Use the new IDA API */
+static inline int ida_get(struct ida *ida, unsigned int min, unsigned int max, gfp_t gfp)
+{
+	#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,18,0)
+	return ida_alloc_range(ida, min, max - 1, gfp);
+	#else
+	return ida_simple_get(ida, min, max, gfp);
+	#endif
+}
+
+static inline void ida_remove(struct ida *ida, unsigned int id)
+{
+	#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,18,0)
+	ida_free(ida, id);
+	#else
+	ida_simple_remove(ida, id);
+	#endif
+}
 
 #endif //GDFS_PXD_COMPAT_H

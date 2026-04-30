@@ -50,8 +50,14 @@ struct pxd_device {
 	unsigned int discard_size;
 
 #define PXD_ACTIVE(pxd_dev)  (atomic_read(&pxd_dev->ncount))
+	// [global] total active requests
+	// usually, this is incremented on submitting IO and decremented on
+	// successful IO completion. But, say the iopath is remote fastpath
+	// and the IO fails => retry IO in native path. native path also
+	// increments/decrements the ncount => ncount should be decremented
+	// even on IO failure in fastpath.
+	atomic_t ncount;
 	// congestion handling
-	atomic_t ncount; // [global] total active requests, always modify with pxd_dev.lock
 	unsigned int qdepth;
 	atomic_t congested;
 	bool exported;
@@ -98,13 +104,12 @@ void pxd_check_q_decongested(struct pxd_device *pxd_dev);
 #define SECTOR_SHIFT (9)
 #endif
 
-#define SEGMENT_SIZE (1024 * 1024)
+// the SEGMENT_SIZE is set to 512K because of a limitation
+// in __fuse_notify_read_data, which could process atmost
+// 128 iovecs per bio_vec (128 * 4096 = 512K)
+#define SEGMENT_SIZE (512 * 1024)
 
-#ifdef __PXD_BIO_MAKEREQ__
-void pxd_reroute_slowpath(struct request_queue *q, struct bio *bio);
-#else
 void pxdmq_reroute_slowpath(struct fuse_req*);
-#endif
 int pxd_initiate_fallback(struct pxd_device *pxd_dev);
 int pxd_initiate_failover(struct pxd_device *pxd_dev);
 

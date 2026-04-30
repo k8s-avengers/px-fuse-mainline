@@ -73,6 +73,8 @@ struct pxd_fastpath_extension {
 int fastpath_init(void);
 void fastpath_cleanup(void);
 
+int fastpath_adjust_fpthreads(int new_pxd_num_fpthreads);
+
 struct workqueue_struct* fastpath_workqueue(void);
 
 struct pxd_update_path_out;
@@ -151,6 +153,7 @@ int remap_io_status(int status)
 
 	return -EIO;
 }
+void fastpath_queue_work(struct kthread_work*, bool completion);
 #endif /* __PX_FASTPATH__ */
 
 #endif /* _PXD_FASTPATH_H_ */

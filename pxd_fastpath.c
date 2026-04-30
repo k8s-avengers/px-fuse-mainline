@@ -2,7 +2,7 @@
 #include <linux/version.h>
 #include <linux/types.h>
 #include <linux/delay.h>
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,18,0)  || (LINUX_VERSION_CODE >= KERNEL_VERSION(5,14,0) && (defined(__EL8__) || defined(__SUSE__)))
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,18,0)  || (LINUX_VERSION_CODE >= KERNEL_VERSION(5,14,0) && (defined(__EL8__) || defined(__SUSE_EQ_SP5__)))
 #include <linux/kdev_t.h>
 #include <linux/uuid.h>
 #include <linux/blk_types.h>
@@ -18,40 +18,274 @@
 #include "pxd.h"
 #include "pxd_core.h"
 #include "pxd_compat.h"
+#include "pxd_trace.h"
 #include "kiolib.h"
 
 // global fastpath IO work queue
 static struct workqueue_struct *gwq;
 
-int fastpath_init(void)
-{
-#ifdef __PXD_BIO_MAKEREQ__
-	printk(KERN_INFO"PXD_BIO_MAKEREQ CPU %d/%d, NUMA nodes %d/%d\n", num_online_cpus(), NR_CPUS, num_online_nodes(), MAX_NUMNODES);
-#else
-	printk(KERN_INFO"PXD_BIO_BLKMQ CPU %d/%d, NUMA nodes %d/%d\n", num_online_cpus(), NR_CPUS, num_online_nodes(), MAX_NUMNODES);
-#endif
+extern uint32_t pxd_num_fpthreads;
 
-	gwq = alloc_workqueue("pxwq", WQ_SYSFS | WQ_UNBOUND | WQ_HIGHPRI, 0);
-	if (!gwq) {
-		printk(KERN_ERR"fastpath workqueue alloc failure\n");
-		return -ENOMEM;
+#define MAX_PXFP_WORKERS_PER_NODE (pxd_num_fpthreads) /// keep it power of 2.
+
+struct pxfpcontext_per_node {
+	bool valid;
+#define MAX_ALLOC_PXFP_WORKER_THREADS_PER_NODE (NR_CPUS)
+	struct kthread_worker *fpworker[MAX_ALLOC_PXFP_WORKER_THREADS_PER_NODE];
+};
+struct kthread_worker *fpdefault = NULL;
+struct pxfpcontext_per_node pxfpctxt[MAX_NUMNODES];
+
+#define BURST_IO (8)
+#define BURST_MASK (BURST_IO-1)
+struct pxfpcontext_percpu {
+  uint8_t fpbatch;
+  unsigned mapped_cpu;
+};
+struct pxfpcontext_percpu pxfp_percpu[NR_CPUS];
+
+static void fastpath_map_workers(void)
+{
+    int i;
+
+    for (i=0; i<NR_CPUS; i++) {
+	pxfp_percpu[i].mapped_cpu = i;
+    }
+}
+
+static void fastpath_flush_work(void) {
+       int node;
+
+       for (node = 0; node < MAX_NUMNODES; node++) {
+               struct pxfpcontext_per_node *c = &pxfpctxt[node];
+               if (c->valid) {
+                       int i;
+                       for (i = 0; i < MAX_PXFP_WORKERS_PER_NODE; i++) {
+                               struct kthread_worker *worker = c->fpworker[i];
+                               if (worker != NULL) {
+                                       kthread_flush_worker(worker);
+                               }
+                       }
+               }
+       }
+}
+
+int fastpath_adjust_fpthreads(int new_pxd_num_fpthreads)
+{
+	int old_pxd_num_fpthreads = pxd_num_fpthreads;
+	int node, cpu;
+	int rc = 0;
+	char namefmt[64];
+
+	if (new_pxd_num_fpthreads > MAX_ALLOC_PXFP_WORKER_THREADS_PER_NODE) {
+		printk(KERN_WARNING"pxd_num_fpthreads(%d) over max limit(%d), reset to max\n", new_pxd_num_fpthreads, MAX_ALLOC_PXFP_WORKER_THREADS_PER_NODE);
+		new_pxd_num_fpthreads = MAX_ALLOC_PXFP_WORKER_THREADS_PER_NODE;
+	}
+	if (new_pxd_num_fpthreads == old_pxd_num_fpthreads) {
+		return 0;
 	}
 
-	return __fastpath_init();
+	if (new_pxd_num_fpthreads == 0) {
+		new_pxd_num_fpthreads = DEFAULT_PXFP_WORKERS_PER_NODE;
+	}
+
+	for_each_online_node(node) {
+		struct pxfpcontext_per_node *c = &pxfpctxt[node];
+		const cpumask_t *cpumask = cpumask_of_node(node);
+		int active;
+
+		if (cpumask_empty(cpumask)) {
+			// NUMA node with no cpu's?! - skip it.
+			printk(KERN_NOTICE"skipping online numa node %d with no attached cpus\n", node);
+			continue;
+		}
+
+		active = 0;
+		// Count already created threads and create more if required
+		for_each_cpu(cpu, cpumask) {
+			struct kthread_worker* worker;
+			if (!cpu_online(cpu)) {
+				continue;
+			}
+
+			if (active == new_pxd_num_fpthreads) {
+				break;
+			}
+
+			// Thread is already created just increment count
+			// While decreasing active will reach new_pxd_num_fpthreads
+			// without creating new threads
+			if (c->fpworker[active] != NULL) {
+				active++;
+				continue;
+			}
+
+			// We need increase num threads, so create more threads
+			snprintf(namefmt, sizeof(namefmt), "pxfpn%dc%d", node, cpu);
+			worker = kthread_create_worker_on_cpu(cpu, 0, namefmt);
+			if (IS_ERR_OR_NULL(worker)) {
+				rc = PTR_ERR(worker);
+				goto out;
+			}
+			c->valid = true;
+			c->fpworker[active++] = worker;
+			if (fpdefault == NULL) {
+				fpdefault = worker;
+			}
+		}
+
+		// If active is less than new_pxd_num_fpthreads,
+		// num cpu is less than new_pxd_num_fpthreads and we cannot create more threads
+		if (active < new_pxd_num_fpthreads) {
+			new_pxd_num_fpthreads = active;
+		}
+	}
+
+	fastpath_map_workers();
+
+	printk(KERN_NOTICE"Updated fpthreads from %d to %d", pxd_num_fpthreads, new_pxd_num_fpthreads);
+	pxd_num_fpthreads = new_pxd_num_fpthreads;
+	return 0;
+
+out:
+	printk(KERN_ERR"fastpath fpthread init failure %d\n", rc);
+	for (node=0; node < MAX_NUMNODES; node++) {
+		struct pxfpcontext_per_node *c = &pxfpctxt[node];
+		if (c->valid) {
+			int i;
+			for (i=pxd_num_fpthreads; i<MAX_ALLOC_PXFP_WORKER_THREADS_PER_NODE; i++) {
+				if (c->fpworker[i] != NULL) {
+					kthread_destroy_worker(c->fpworker[i]);
+					c->fpworker[i] = NULL;
+				}
+			}
+		}
+	}
+	return rc;
+}
+
+int fastpath_init(void)
+{
+	int rc = 0;
+	int node, cpu;
+	char namefmt[64];
+
+	// sanity check the pxfp worker thread values from mod param
+	if (MAX_PXFP_WORKERS_PER_NODE > MAX_ALLOC_PXFP_WORKER_THREADS_PER_NODE) {
+		printk(KERN_WARNING"pxd_num_fpthreads(%d) over max limit(%d), reset to max\n", MAX_PXFP_WORKERS_PER_NODE, MAX_ALLOC_PXFP_WORKER_THREADS_PER_NODE);
+		MAX_PXFP_WORKERS_PER_NODE = MAX_ALLOC_PXFP_WORKER_THREADS_PER_NODE;
+	}
+
+	printk(KERN_INFO"PXD_BIO_BLKMQ CPU %d/%d, NUMA nodes %d/%d\n", num_online_cpus(), NR_CPUS, num_online_nodes(), MAX_NUMNODES);
+	printk(KERN_INFO"pxd inited with %d workers per numa node\n", MAX_PXFP_WORKERS_PER_NODE);
+	gwq = alloc_workqueue("pxwq", WQ_HIGHPRI, 0);
+	if (!gwq) {
+		printk(KERN_ERR"fastpath workqueue alloc failure\n");
+		rc = -ENOMEM;
+		goto out;
+	}
+
+	memset(&pxfpctxt, 0, sizeof(pxfpctxt));
+	for_each_online_node(node) {
+		struct pxfpcontext_per_node *c = &pxfpctxt[node];
+		const cpumask_t *cpumask = cpumask_of_node(node);
+		int active;
+
+		// unexpected!
+		if (c->valid) {
+			printk(KERN_NOTICE"pxd fastpath context on numa node %d already initialized, skipping\n", node);
+			continue;
+		}
+
+		if (cpumask_empty(cpumask)) {
+			// NUMA node with no cpu's?! - skip it.
+			printk(KERN_NOTICE"skipping online numa node %d with no attached cpus\n", node);
+			continue;
+		}
+
+		active = 0;
+		for_each_cpu(cpu, cpumask) {
+			struct kthread_worker* worker;
+			if (!cpu_online(cpu)) {
+				continue;
+			}
+			snprintf(namefmt, sizeof(namefmt), "pxfpn%dc%d", node, cpu);
+			worker = kthread_create_worker_on_cpu(cpu, 0, namefmt);
+			if (IS_ERR_OR_NULL(worker)) {
+				rc = PTR_ERR(worker);
+				goto out;
+			}
+			c->valid = true;
+			c->fpworker[active++] = worker;
+			if (fpdefault == NULL) {
+				fpdefault = worker;
+			}
+			if (active == MAX_PXFP_WORKERS_PER_NODE) {
+				break;
+			}
+		}
+	}
+	// always confirm default
+	if (fpdefault == NULL) {
+		// fastpath init failed.
+		printk(KERN_ERR"found no online node with online cpus\n");
+		rc = -EINVAL;
+		goto out;
+	}
+
+	fastpath_map_workers();
+
+	rc = __fastpath_init();
+	if (rc == 0) {
+		return rc;
+	}
+	/* fallthrough */
+out:
+	printk(KERN_ERR"fastpath workqueue init failure %d\n", rc);
+	for (node=0; node < MAX_NUMNODES; node++) {
+		struct pxfpcontext_per_node *c = &pxfpctxt[node];
+		if (c->valid) {
+			int i;
+			for (i=0; i<MAX_ALLOC_PXFP_WORKER_THREADS_PER_NODE; i++) {
+				if (c->fpworker[i] != NULL) {
+					kthread_destroy_worker(c->fpworker[i]);
+					c->fpworker[i] = NULL;
+				}
+			}
+		}
+	}
+	if (gwq != NULL) {
+		destroy_workqueue(gwq);
+	}
+	return rc;
 }
 
 void fastpath_cleanup(void)
 {
-	if (gwq) {
+	int i;
+	int node;
+
+	if (gwq != NULL) {
 		destroy_workqueue(gwq);
-		gwq = NULL;
+	}
+
+	for (node=0; node < MAX_NUMNODES; node++) {
+		struct pxfpcontext_per_node *c = &pxfpctxt[node];
+		if (c->valid) {
+			for (i=0; i<MAX_ALLOC_PXFP_WORKER_THREADS_PER_NODE; i++) {
+				if (c->fpworker[i] != NULL) {
+					kthread_destroy_worker(c->fpworker[i]);
+					c->fpworker[i] = NULL;
+				}
+			}
+		}
 	}
 	__fastpath_cleanup();
 }
 
 struct workqueue_struct* fastpath_workqueue(void)
 {
-	return gwq;
+	return gwq; // only used by non-blkmq code and special cases
 }
 
 void pxd_abortfailQ(struct pxd_device *pxd_dev)
@@ -117,11 +351,19 @@ int pxd_request_ioswitch(struct pxd_device *pxd_dev, int code)
 		return -EINVAL;
 	}
 
+	// Check FUSE connection before attempting ioswitch
+	if (!pxd_dev->ctx || !READ_ONCE(pxd_dev->ctx->fc.connected)) {
+		printk(KERN_WARNING "device %llu ioswitch failed: FUSE disconnected.\n",
+			pxd_dev->dev_id);
+		return -ENOTCONN;
+	}
+
 	switch (code) {
 	case PXD_FAILOVER_TO_USERSPACE:
 		printk("device %llu initiated failover\n", pxd_dev->dev_id);
 		// IO path blocked, a future path refresh will take it to native path
 		// enqueue a failover request to userspace on this device.
+		trace_pxd_initiate_failover(pxd_dev->dev_id, pxd_dev->minor, FAILOVER_REASON_USERSPACE);
 		return pxd_initiate_failover(pxd_dev);
 	case PXD_FALLBACK_TO_KERNEL:
 		// IO path already routed to userspace.
@@ -134,12 +376,48 @@ int pxd_request_ioswitch(struct pxd_device *pxd_dev, int code)
 	}
 }
 
+#define SYNC_TIMEOUT (60000)
+static int wait_for_sync(struct pxd_device *pxd_dev, bool skipsync)
+{
+        struct pxd_fastpath_extension *fp = &pxd_dev->fp;
+        int i;
+        // assumes fastpath_enabled() is true
+        // and IO is already suspended
+        BUG_ON(!fastpath_enabled(pxd_dev));
+        BUG_ON(!atomic_read(&fp->suspend));
+
+        if (skipsync) return 0;
+
+        if (pxd_sync_work_pending(pxd_dev)) {
+                printk(KERN_INFO "device %llu sync work pending\n", pxd_dev->dev_id);
+                return -EBUSY;
+        }
+
+        atomic_set(&fp->sync_done, MAX_PXD_BACKING_DEVS);
+        reinit_completion(&fp->sync_complete);
+        for (i = 0; i < MAX_PXD_BACKING_DEVS; i++) {
+                queue_work(fastpath_workqueue(), &fp->syncwi[i].ws);
+        }
+
+        if (!wait_for_completion_timeout(&fp->sync_complete,
+                                                msecs_to_jiffies(SYNC_TIMEOUT))) {
+                // suspend aborted as sync timedout
+                return -EBUSY;
+        }
+
+        for (i = 0; i < MAX_PXD_BACKING_DEVS; i++) {
+                // capture first failure
+                if (fp->syncwi[i].rc) return fp->syncwi[i].rc;
+        }
+
+        return 0;
+}
+
 // shall be called internally during iopath switching.
 int pxd_request_suspend_internal(struct pxd_device *pxd_dev,
 		bool skip_flush, bool coe)
 {
 	struct pxd_fastpath_extension *fp = &pxd_dev->fp;
-	int i;
 	int rc;
 
 	if (!fastpath_enabled(pxd_dev)) {
@@ -155,28 +433,9 @@ int pxd_request_suspend_internal(struct pxd_device *pxd_dev,
 
 	if (skip_flush || !fp->fastpath) return 0;
 
-	atomic_set(&fp->sync_done, MAX_PXD_BACKING_DEVS);
-	reinit_completion(&fp->sync_complete);
-	for (i = 0; i < MAX_PXD_BACKING_DEVS; i++) {
-		queue_work(fastpath_workqueue(), &fp->syncwi[i].ws);
-	}
-
-#define SYNC_TIMEOUT (60000)
-	rc = 0;
-	if (!wait_for_completion_timeout(&fp->sync_complete,
-						msecs_to_jiffies(SYNC_TIMEOUT))) {
-		// suspend aborted as sync timedout
-		rc = -EBUSY;
+	rc = wait_for_sync(pxd_dev, skip_flush);
+	if (rc)
 		goto fail;
-	}
-
-	// consolidate responses
-	for (i = 0; i < MAX_PXD_BACKING_DEVS; i++) {
-		// capture first failure
-		rc = fp->syncwi[i].rc;
-		if (rc) goto fail;
-	}
-
 	printk(KERN_NOTICE"device %llu suspended IO from userspace\n", pxd_dev->dev_id);
 	return 0;
 fail:
@@ -259,7 +518,7 @@ void enableFastPath(struct pxd_device *pxd_dev, bool force)
 
 	decode_mode(mode, modestr);
 	for (i = 0; i < nfd; i++) {
-		if (fp->file[i] > 0) { /* valid fd exists already */
+		if (fp->file[i]) { /* valid fd exists already */
 			if (force) {
 				printk("dev %llu:%s closing file desc %px\n",
 						pxd_dev->dev_id, __func__, fp->file[i]);
@@ -311,7 +570,7 @@ void enableFastPath(struct pxd_device *pxd_dev, bool force)
 out_file_failed:
 	fp->nfd = 0;
 	for (i = 0; i < nfd; i++) {
-		if (fp->file[i] > 0) filp_close(fp->file[i], NULL);
+		if (fp->file[i]) filp_close(fp->file[i], NULL);
 	}
 	memset(fp->file, 0, sizeof(fp->file));
 	memset(fp->device_path, 0, sizeof(fp->device_path));
@@ -341,33 +600,40 @@ void disableFastPath(struct pxd_device *pxd_dev, bool skipsync)
 
 	if (!fastpath_enabled(pxd_dev) || !pxd_dev->fp.nfd ||
 			!fastpath_active(pxd_dev)) {
-		pxd_dev->fp.active_failover = false;
+		pxd_dev->fp.nfd = 0;
 		pxd_dev->fp.fastpath = false;
 		return;
 	}
 
 	pxd_suspend_io(pxd_dev);
+	WRITE_ONCE(pxd_dev->fp.fastpath, false);
+	// in pxd_queue_rq, if there are existing readers in the RCU read side critical section
+	// synchronize_rcu will wait for them to end (queue to fastpath kthread)
+	synchronize_rcu();
+	// at this point, all readers would see pxd_dev->fp.fastpath = false
+	fastpath_flush_work();
 
 	if (PXD_ACTIVE(pxd_dev)) {
 		printk(KERN_WARNING"%s: pxd device %llu fastpath disabled with active IO (%d)\n",
 			__func__, pxd_dev->dev_id, PXD_ACTIVE(pxd_dev));
 	}
 
+	if (!skipsync) {
+		int rc;
+		rc = wait_for_sync(pxd_dev, skipsync);
+		if (unlikely(rc) && rc != -EINVAL && rc != -EIO) {
+			printk(KERN_ERR"device %llu sync failed %d, continuing with disable\n",
+					pxd_dev->dev_id, rc);
+		}
+	}
+
 	for (i = 0; i < nfd; i++) {
-		if (fp->file[i] > 0) {
-			if (!skipsync) {
-				int ret = vfs_fsync(fp->file[i], 0);
-				if (unlikely(ret && ret != -EINVAL && ret != -EIO)) {
-					printk(KERN_WARNING"device %llu fsync failed with %d\n", pxd_dev->dev_id, ret);
-				}
-			}
+		if (fp->file[i] != NULL) {
 			filp_close(fp->file[i], NULL);
 			fp->file[i] = NULL;
 		}
 	}
 	fp->nfd = 0;
-	pxd_dev->fp.fastpath = false;
-	pxd_dev->fp.can_failover = false;
 
 	pxd_resume_io(pxd_dev);
 }
@@ -462,7 +728,7 @@ int pxd_init_fastpath_target(struct pxd_device *pxd_dev, struct pxd_update_path_
 out_file_failed:
 	disableFastPath(pxd_dev, false);
 	for (i = 0; i < pxd_dev->fp.nfd; i++) {
-		if (pxd_dev->fp.file[i] > 0) filp_close(pxd_dev->fp.file[i], NULL);
+		if (pxd_dev->fp.file[i]) filp_close(pxd_dev->fp.file[i], NULL);
 	}
 	pxd_dev->fp.nfd = 0;
 	memset(pxd_dev->fp.file, 0, sizeof(pxd_dev->fp.file));
@@ -517,11 +783,20 @@ void pxd_fastpath_adjust_limits(struct pxd_device *pxd_dev, struct request_queue
 	}
 
 	// ensure few block properties are still as expected.
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,10,0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,9,0) || (LINUX_VERSION_CODE >= KERNEL_VERSION(5,14,0) && defined(__EL8__))
+	topque->limits.max_write_zeroes_sectors = 0;
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(4,10,0)
 	blk_queue_max_write_zeroes_sectors(topque, 0);
 #endif
+
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,9,0) || (LINUX_VERSION_CODE >= KERNEL_VERSION(5,14,0) && defined(__EL8__))
+	topque->limits.logical_block_size = PXD_LBS;
+	topque->limits.physical_block_size = PXD_LBS;
+#else
 	blk_queue_logical_block_size(topque, PXD_LBS);
 	blk_queue_physical_block_size(topque, PXD_LBS);
+#endif
 	return;
 
 out:
@@ -536,6 +811,7 @@ void pxd_fastpath_reset_device(struct pxd_device *pxd_dev)
 	struct pxd_context *ctx = pxd_dev->ctx;
 	struct fuse_conn *fc = &ctx->fc;
 	struct fuse_req *req;
+	bool ioswitch_active;
 
 	if (!fastpath_enabled(pxd_dev)) {
 		return;
@@ -543,10 +819,13 @@ void pxd_fastpath_reset_device(struct pxd_device *pxd_dev)
 
 	disableFastPath(pxd_dev, true);
 
+	ioswitch_active = atomic_read(&fp->ioswitch_active);
 	// abort any inflight ioswitch
-	if (atomic_read(&fp->ioswitch_active)) {
+	if (ioswitch_active) {
 		req = request_find(fc, pxd_dev->fp.switch_uid);
 		if (!IS_ERR_OR_NULL(req)) {
+			trace_pxd_fastpath_reset_device(pxd_dev->dev_id, pxd_dev->minor,
+				ioswitch_active, pxd_dev->fp.switch_uid);
 			// overwrite switch request to fail all pending IOs
 			req->in.h.opcode = PXD_FAILOVER_TO_USERSPACE;
 			req->out.h.error = -EIO; // force failure status
@@ -555,6 +834,9 @@ void pxd_fastpath_reset_device(struct pxd_device *pxd_dev)
 			pxd_dev->fp.switch_uid = 0;
 			atomic_set(&fp->ioswitch_active, 0);
 		}
+	} else {
+		trace_pxd_fastpath_reset_device(pxd_dev->dev_id, pxd_dev->minor,
+			ioswitch_active, 0);
 	}
 
 	// resume from userspace IO suspends
@@ -592,6 +874,42 @@ int pxd_debug_switch_nativepath(struct pxd_device* pxd_dev)
 	}
 
 	return 0;
+}
+
+static
+unsigned int balanceIO(struct pxfpcontext_per_node *c, unsigned int cpuid, bool completion)
+{
+	if (completion)
+		return cpuid;
+
+	if (cpuid < NR_CPUS) {
+		struct pxfpcontext_percpu *this = &pxfp_percpu[cpuid];
+		int burst = ++this->fpbatch;
+		if ((burst & BURST_MASK)== 0) {
+			this->mapped_cpu++;
+		}
+		return this->mapped_cpu;
+	}
+
+	return 0; // not possible case
+}
+
+// assign work on the worker thread with least penalty. loadbalance
+// across threads if no hint provided through 'qnum'
+void fastpath_queue_work(struct kthread_work* work, bool completion)
+{
+	unsigned int cpuid = smp_processor_id();
+	int node = cpu_to_node(cpuid);
+	struct kthread_worker *worker = fpdefault;
+
+	if (node < MAX_NUMNODES) {
+		struct pxfpcontext_per_node *c = &pxfpctxt[node];
+		if (c->valid) {
+			cpuid = balanceIO(c, cpuid, completion);
+			worker = c->fpworker[cpuid % MAX_PXFP_WORKERS_PER_NODE];
+		}
+	}
+	kthread_queue_work(worker, work);
 }
 
 #endif /* __PX_FASTPATH__ */
